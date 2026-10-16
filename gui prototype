@@ -1,0 +1,1308 @@
+
+import os
+import csv
+import math
+import time
+import queue
+import threading
+import struct
+import statistics
+from collections import deque
+from datetime import datetime, date
+
+import numpy as np
+import serial
+import PySimpleGUI as sg
+
+from scipy.signal import butter, filtfilt
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+PORT = "/dev/cu.ESP32testJoseph"
+BAUDRATE = 115200
+
+# ESP32 packet structure:
+# uint32_t sequenceNumber
+# float heartRate2
+# uint16_t sensor2Data[50]
+PACKET_FORMAT = "<If50H"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+
+SAMPLES_PER_PACKET = 50
+SAMPLE_INTERVAL = 0.02
+SAMPLE_RATE = 50.0
+
+# Five seconds of PPG data for Python signal processing
+PROCESSING_WINDOW_SIZE = 250
+
+# Ten seconds shown on the raw PPG graph
+GRAPH_WINDOW_SECONDS = 10
+
+# Automatic Bluetooth reconnection delay
+RECONNECT_DELAY = 2.0
+
+DATA_FILE = os.path.join(
+    os.path.expanduser("~/Downloads"),
+    "pulse_monitor_readings.csv"
+)
+
+CSV_FIELDS = [
+    "timestamp",
+    "date",
+    "bpm",
+    "indicator",
+    "indicator_changed",
+    "alert_event",
+    "mode"
+]
+
+bluetooth_queue = queue.Queue()
+stop_receiver = threading.Event()
+
+
+# ============================================================
+# 2. PPG SIGNAL PROCESSING
+# ============================================================
+
+class PPGSignalProcessor:
+    """
+    Filter PPG samples and estimate BPM using an FFT.
+
+    The ESP32-calculated BPM remains the primary BPM reading.
+    This class calculates a separate Python estimate.
+    """
+
+    def __init__(self, fs: float = 50.0):
+        self.fs = fs
+        nyq = 0.5 * fs
+
+        # Second-order Butterworth bandpass filter:
+        # 0.5-4.0 Hz, approximately 30-240 BPM.
+        self.b, self.a = butter(
+            2,
+            [0.5 / nyq, 4.0 / nyq],
+            btype="band"
+        )
+
+    def filter_signal(self, raw_data: np.ndarray) -> np.ndarray:
+        """Apply the Butterworth bandpass filter."""
+
+        raw_data = np.asarray(raw_data, dtype=float)
+
+        if len(raw_data) < 15:
+            return raw_data
+
+        return filtfilt(self.b, self.a, raw_data)
+
+    def calculate_fft_bpm(self, signal_window: np.ndarray):
+        """Estimate BPM from the dominant FFT frequency."""
+
+        signal_window = np.asarray(signal_window, dtype=float)
+        N = len(signal_window)
+
+        if N == 0:
+            return 0.0, np.array([]), np.array([])
+
+        windowed = signal_window * np.hanning(N)
+        n_fft = 2048
+
+        fft_vals = np.abs(
+            np.fft.rfft(windowed, n=n_fft)
+        )
+
+        freqs = np.fft.rfftfreq(
+            n_fft,
+            d=1.0 / self.fs
+        )
+
+        # Restrict estimate to 42-210 BPM.
+        valid_idx = np.where(
+            (freqs >= 0.7) & (freqs <= 3.5)
+        )[0]
+
+        if len(valid_idx) == 0:
+            return 0.0, freqs, fft_vals
+
+        # Avoid reporting BPM from a nearly flat signal.
+        if np.std(signal_window) < 5:
+            return 0.0, freqs, fft_vals
+
+        peak_idx = valid_idx[
+            np.argmax(fft_vals[valid_idx])
+        ]
+
+        dominant_freq = freqs[peak_idx]
+
+        estimated_bpm = round(
+            float(dominant_freq * 60.0),
+            1
+        )
+
+        return estimated_bpm, freqs, fft_vals
+
+
+signal_processor = PPGSignalProcessor(fs=SAMPLE_RATE)
+
+
+# ============================================================
+# 3. CSV LOGGING
+# ============================================================
+
+def save_reading(
+    timestamp,
+    bpm,
+    indicator,
+    indicator_changed,
+    alert_event,
+    mode
+):
+    """Save the ESP32 BPM reading and indicator to CSV."""
+
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+
+    file_exists = (
+        os.path.exists(DATA_FILE)
+        and os.path.getsize(DATA_FILE) > 0
+    )
+
+    with open(DATA_FILE, "a", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=CSV_FIELDS
+        )
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow({
+            "timestamp": timestamp.strftime(
+                "%d/%m/%Y %H:%M:%S"
+            ),
+            "date": timestamp.strftime("%Y-%m-%d"),
+            "bpm": round(bpm, 1),
+            "indicator": indicator,
+            "indicator_changed": indicator_changed,
+            "alert_event": alert_event,
+            "mode": mode
+        })
+
+
+def load_day_records(selected_date):
+    """Return saved records for one date."""
+
+    records = []
+
+    if not os.path.exists(DATA_FILE):
+        return records
+
+    try:
+        with open(DATA_FILE, "r", newline="") as file:
+            reader = csv.DictReader(file)
+
+            for row in reader:
+                if row.get("date") == selected_date:
+                    records.append(row)
+
+    except OSError as error:
+        print(f"Could not read CSV file: {error}")
+
+    records.sort(key=lambda row: row.get("timestamp", ""))
+
+    return records
+
+
+def load_latest_indicator():
+    """Get the last saved indicator."""
+
+    if not os.path.exists(DATA_FILE):
+        return None
+
+    try:
+        with open(DATA_FILE, "r", newline="") as file:
+            rows = list(csv.DictReader(file))
+
+        if rows:
+            return rows[-1].get("indicator")
+
+    except OSError as error:
+        print(f"Could not read previous indicator: {error}")
+
+    return None
+
+
+# ============================================================
+# 4. DAILY SUMMARY
+# ============================================================
+
+def show_daily_summary(selected_date):
+    """Calculate and display the daily BPM summary."""
+
+    records = load_day_records(selected_date)
+
+    if not records:
+        sg.popup(
+            f"No readings were found for {selected_date}.",
+            title="Daily Summary"
+        )
+        return
+
+    bpm_values = []
+
+    for row in records:
+        try:
+            bpm = float(row["bpm"])
+
+            if math.isfinite(bpm) and 0 < bpm <= 250:
+                bpm_values.append(bpm)
+
+        except (ValueError, KeyError, TypeError):
+            continue
+
+    if not bpm_values:
+        sg.popup(
+            "No valid BPM readings were found.",
+            title="Daily Summary"
+        )
+        return
+
+    mean_bpm = statistics.mean(bpm_values)
+    min_bpm = min(bpm_values)
+    max_bpm = max(bpm_values)
+
+    std_bpm = (
+        statistics.pstdev(bpm_values)
+        if len(bpm_values) > 1 else 0.0
+    )
+
+    low_alerts = sum(
+        row.get("alert_event") == "LOW"
+        for row in records
+    )
+
+    high_alerts = sum(
+        row.get("alert_event") == "HIGH"
+        for row in records
+    )
+
+    indicator_changes = [
+        f'{row["timestamp"]}: {row["indicator"]}'
+        for row in records
+        if row.get("indicator_changed") == "YES"
+    ]
+
+    change_text = (
+        "\n".join(indicator_changes)
+        if indicator_changes
+        else "No indicator changes recorded."
+    )
+
+    summary = (
+        f"Date: {selected_date}\n\n"
+        f"Valid BPM readings: {len(bpm_values)}\n"
+        f"Mean BPM: {mean_bpm:.1f}\n"
+        f"Minimum BPM: {min_bpm:.1f}\n"
+        f"Maximum BPM: {max_bpm:.1f}\n"
+        f"Population standard deviation: {std_bpm:.1f}\n\n"
+        f"LOW alert events: {low_alerts}\n"
+        f"HIGH alert events: {high_alerts}\n\n"
+        f"Indicator changes:\n{change_text}"
+    )
+
+    sg.popup_scrolled(
+        summary,
+        title="Daily Summary",
+        size=(65, 25),
+        font=("Arial", 11)
+    )
+
+
+# ============================================================
+# 5. GRAPH SETUP AND UPDATES
+# ============================================================
+
+def add_plots(canvas_element):
+    """Create raw and filtered PPG subplots."""
+
+    figure = Figure(figsize=(7, 5), dpi=100)
+
+    ax_raw = figure.add_subplot(211)
+    ax_filtered = figure.add_subplot(212)
+
+    canvas = FigureCanvasTkAgg(
+        figure,
+        canvas_element.TKCanvas
+    )
+
+    canvas.draw()
+
+    canvas.get_tk_widget().pack(
+        side="top",
+        fill="both",
+        expand=True
+    )
+
+    return ax_raw, ax_filtered, canvas
+
+
+def update_ppg_plots(
+    ax_raw,
+    ax_filtered,
+    fig_canvas,
+    ppg_times,
+    raw_values,
+    filtered_values
+):
+    """Update the raw and filtered PPG graphs."""
+
+    # -----------------------------
+    # Raw PPG graph
+    # -----------------------------
+    ax_raw.clear()
+    ax_raw.set_title("Raw PPG Signal")
+    ax_raw.set_ylabel("ADC Reading")
+    ax_raw.set_xlabel("Time (seconds)")
+    ax_raw.grid(True, alpha=0.3)
+
+    if ppg_times and raw_values:
+        raw_times = list(ppg_times)
+        raw_data = list(raw_values)
+
+        ax_raw.plot(
+            raw_times,
+            raw_data,
+            linewidth=1
+        )
+
+        latest_time = raw_times[-1]
+        earliest_time = max(
+            0,
+            latest_time - GRAPH_WINDOW_SECONDS
+        )
+
+        ax_raw.set_xlim(
+            earliest_time,
+            max(
+                earliest_time + GRAPH_WINDOW_SECONDS,
+                latest_time
+            )
+        )
+
+    # -----------------------------
+    # Filtered PPG graph
+    # -----------------------------
+    ax_filtered.clear()
+    ax_filtered.set_title("Filtered PPG Signal")
+    ax_filtered.set_ylabel("Filtered amplitude")
+    ax_filtered.set_xlabel("Time (seconds)")
+    ax_filtered.grid(True, alpha=0.3)
+
+    if len(filtered_values) > 0 and len(ppg_times) > 0:
+        filtered_data = list(filtered_values)
+
+        number_to_plot = min(
+            len(filtered_data),
+            len(ppg_times)
+        )
+
+        filtered_times = list(ppg_times)[-number_to_plot:]
+        filtered_to_plot = filtered_data[-number_to_plot:]
+
+        ax_filtered.plot(
+            filtered_times,
+            filtered_to_plot,
+            linewidth=1.2
+        )
+
+        # Display the latest filtered samples across the graph.
+        if len(filtered_times) > 1:
+            ax_filtered.set_xlim(
+                filtered_times[0],
+                filtered_times[-1]
+            )
+
+    # -----------------------------
+    # Refresh both graphs
+    # -----------------------------
+    fig_canvas.figure.tight_layout(pad=2.0)
+    fig_canvas.draw()
+
+
+# ============================================================
+# 6. STATUS DISPLAY
+# ============================================================
+
+def set_status(window, key, label, colour):
+    """Update a system status label."""
+
+    window[key].update(
+        f"● {label}",
+        text_color=colour
+    )
+
+
+# ============================================================
+# 7. BLUETOOTH PACKET DECODING
+# ============================================================
+
+def decode_packet(packet):
+    """Decode one complete ESP32 packet."""
+
+    if len(packet) != PACKET_SIZE:
+        return None
+
+    try:
+        unpacked = struct.unpack(
+            PACKET_FORMAT,
+            packet
+        )
+
+        sequence_number = unpacked[0]
+        heart_rate = unpacked[1]
+        raw_samples = list(unpacked[2:])
+
+        if not math.isfinite(heart_rate):
+            return None
+
+        if not 0 <= heart_rate <= 250:
+            return None
+
+        if any(sample > 4095 for sample in raw_samples):
+            return None
+
+        return sequence_number, heart_rate, raw_samples
+
+    except (struct.error, ValueError):
+        return None
+
+
+# ============================================================
+# 8. BLUETOOTH RECEIVER WITH AUTO-RECONNECTION
+# ============================================================
+
+def bluetooth_receiver():
+    """
+    Receive ESP32 binary packets in a background thread.
+
+    On a serial connection error:
+    1. Report disconnection.
+    2. Close the old connection.
+    3. Wait two seconds.
+    4. Attempt to reconnect automatically.
+
+    Packet resynchronisation is best-effort because the current
+    ESP32 packet format has no unique marker or checksum.
+    """
+
+    while not stop_receiver.is_set():
+        connection = None
+
+        try:
+            # --------------------------------------------
+            # ATTEMPT TO CONNECT
+            # --------------------------------------------
+            bluetooth_queue.put(("status", "connecting"))
+
+            connection = serial.Serial(
+                port=PORT,
+                baudrate=BAUDRATE,
+                bytesize=serial.EIGHTBITS,
+                timeout=0.2,
+                stopbits=serial.STOPBITS_ONE
+            )
+
+            print(f"Bluetooth connected: {PORT}")
+
+            bluetooth_queue.put(("status", "connected"))
+
+            # Start with a fresh buffer for this connection.
+            buffer = bytearray()
+
+            # --------------------------------------------
+            # RECEIVE AND DECODE PACKETS
+            # --------------------------------------------
+            while not stop_receiver.is_set():
+
+                chunk = connection.read(512)
+
+                if not chunk:
+                    # A read timeout does not necessarily mean
+                    # Bluetooth has disconnected.
+                    continue
+
+                buffer.extend(chunk)
+
+                while len(buffer) >= PACKET_SIZE:
+
+                    candidate = bytes(buffer[:PACKET_SIZE])
+                    decoded = decode_packet(candidate)
+
+                    if decoded is not None:
+                        del buffer[:PACKET_SIZE]
+
+                        bluetooth_queue.put(
+                            ("packet", decoded)
+                        )
+
+                        continue
+
+                    # ------------------------------------
+                    # BEST-EFFORT PACKET RESYNCHRONISATION
+                    # ------------------------------------
+                    found = False
+                    max_offset = len(buffer) - PACKET_SIZE
+
+                    for offset in range(1, max_offset + 1):
+
+                        candidate = bytes(
+                            buffer[offset:offset + PACKET_SIZE]
+                        )
+
+                        decoded = decode_packet(candidate)
+
+                        if decoded is not None:
+                            del buffer[:offset + PACKET_SIZE]
+
+                            bluetooth_queue.put(
+                                ("packet", decoded)
+                            )
+
+                            found = True
+                            break
+
+                    if not found:
+                        # Keep enough bytes to complete a packet
+                        # when the next serial chunk arrives.
+                        del buffer[:-PACKET_SIZE + 1]
+                        break
+
+        except (serial.SerialException, OSError) as error:
+
+            if not stop_receiver.is_set():
+                print(f"Bluetooth connection lost: {error}")
+
+                bluetooth_queue.put(
+                    ("status", "disconnected")
+                )
+
+        finally:
+            # --------------------------------------------
+            # CLOSE THE OLD CONNECTION
+            # --------------------------------------------
+            if connection is not None:
+                try:
+                    if connection.is_open:
+                        connection.close()
+
+                except (serial.SerialException, OSError) as error:
+                    print(f"Error closing serial port: {error}")
+
+        # --------------------------------------------
+        # WAIT BEFORE RETRYING
+        # --------------------------------------------
+        if not stop_receiver.is_set():
+            bluetooth_queue.put(("status", "connecting"))
+
+            print(
+                f"Retrying Bluetooth connection in "
+                f"{RECONNECT_DELAY:.0f} seconds..."
+            )
+
+            stop_receiver.wait(RECONNECT_DELAY)
+
+    print("Bluetooth receiver stopped.")
+
+
+# ============================================================
+# 9. USER SETTINGS
+# ============================================================
+
+user_name = "Grace"
+
+resting_mean = 75.0
+resting_alert = 20.0
+
+exercise_mean = 120.0
+exercise_alert = 30.0
+
+exercise_mode = False
+
+previous_indicator = load_latest_indicator()
+
+
+# ============================================================
+# 10. GUI LAYOUT
+# ============================================================
+
+sg.theme("LightBlue")
+
+layout = [
+    [
+        sg.Text(
+            "Pulse Monitor",
+            font=("Arial", 28, "bold"),
+            text_color="white",
+            background_color="#A9C9E8",
+            justification="center",
+            expand_x=True,
+            pad=(5, 10)
+        )
+    ],
+
+    [
+        sg.Text("Battery: N/A", key="-BATTERY-"),
+        sg.Push(),
+        sg.Text("User:"),
+        sg.Text(user_name, key="-USER-DISPLAY-")
+    ],
+
+    [
+        sg.Frame(
+            "Pulse Rate",
+            [
+                [
+                    sg.Text("ESP32 BPM:"),
+                    sg.Text(
+                        "--",
+                        key="-CURRENT-BPM-",
+                        font=("Arial", 20, "bold")
+                    )
+                ],
+                [
+                    sg.Text("Python FFT estimate:"),
+                    sg.Text(
+                        "--",
+                        key="-FFT-BPM-",
+                        font=("Arial", 14, "bold")
+                    ),
+                    sg.Text(
+                        "Needs more samples",
+                        key="-FFT-STATUS-",
+                        text_color="gray"
+                    )
+                ],
+                [
+                    sg.Text(
+                        "LOW",
+                        key="-LOW-",
+                        size=(12, 2),
+                        justification="center",
+                        relief="groove"
+                    ),
+                    sg.Text(
+                        "NORMAL",
+                        key="-NORMAL-",
+                        size=(12, 2),
+                        justification="center",
+                        relief="groove"
+                    ),
+                    sg.Text(
+                        "HIGH",
+                        key="-HIGH-",
+                        size=(12, 2),
+                        justification="center",
+                        relief="groove"
+                    )
+                ]
+            ],
+            expand_x=True
+        )
+    ],
+
+    [
+        sg.Frame(
+            "System Status",
+            [[
+                sg.Text(
+                    "● Monitoring: Waiting",
+                    key="-MONITORING-",
+                    text_color="orange",
+                    size=(29, 1)
+                ),
+                sg.Text(
+                    "● Bluetooth: Connecting",
+                    key="-BLUETOOTH-",
+                    text_color="orange",
+                    size=(34, 1)
+                ),
+                sg.Text(
+                    "● Log: Waiting",
+                    key="-LOG-STATUS-",
+                    text_color="orange",
+                    size=(25, 1)
+                )
+            ]],
+            expand_x=True
+        )
+    ],
+
+    [
+        sg.Frame(
+            "Settings",
+            [
+                [
+                    sg.Text("User name"),
+                    sg.Input(
+                        user_name,
+                        key="-USER-",
+                        size=(12, 1)
+                    ),
+                    sg.Text("Resting mean BPM"),
+                    sg.Input(
+                        str(resting_mean),
+                        key="-REST-MEAN-",
+                        size=(8, 1)
+                    ),
+                    sg.Text("Resting alert range ±"),
+                    sg.Input(
+                        str(resting_alert),
+                        key="-REST-ALERT-",
+                        size=(7, 1)
+                    )
+                ],
+                [
+                    sg.Text("Exercise mean BPM"),
+                    sg.Input(
+                        str(exercise_mean),
+                        key="-EX-MEAN-",
+                        size=(8, 1)
+                    ),
+                    sg.Text("Exercise alert range ±"),
+                    sg.Input(
+                        str(exercise_alert),
+                        key="-EX-ALERT-",
+                        size=(7, 1)
+                    ),
+                    sg.Checkbox(
+                        "Exercise mode",
+                        default=False,
+                        key="-MODE-",
+                        enable_events=True
+                    ),
+                    sg.Button("Save Settings", key="-SAVE-"),
+                    sg.Button("Info", key="-INFO-")
+                ]
+            ],
+            expand_x=True
+        )
+    ],
+
+    [
+        sg.Canvas(
+            key="-CANVAS-",
+            size=(700, 420),
+            expand_x=True,
+            expand_y=True
+        )
+    ],
+
+    [
+        sg.Frame(
+            "Daily Summary",
+            [[
+                sg.Text("Date (YYYY-MM-DD):"),
+                sg.Input(
+                    date.today().strftime("%Y-%m-%d"),
+                    key="-SUMMARY-DATE-",
+                    size=(14, 1)
+                ),
+                sg.Button(
+                    "Show Daily Summary",
+                    key="-DAILY-SUMMARY-"
+                )
+            ]],
+            expand_x=True
+        )
+    ],
+
+    [
+        sg.Frame(
+            "System Log",
+            [[
+                sg.Multiline(
+                    "",
+                    key="-LOG-",
+                    size=(110, 5),
+                    disabled=True,
+                    autoscroll=True,
+                    expand_x=True
+                )
+            ]],
+            expand_x=True
+        )
+    ],
+
+    [sg.Button("Exit", key="-EXIT-")]
+]
+
+
+my_window = sg.Window(
+    "Pulse Monitor",
+    layout,
+    finalize=True,
+    resizable=True,
+    size=(1150, 900)
+)
+
+
+# ============================================================
+# 11. INITIALISE PLOTS AND PPG BUFFERS
+# ============================================================
+
+ax_raw, ax_filtered, fig_canvas = add_plots(
+    my_window["-CANVAS-"]
+)
+
+ppg_times = deque(maxlen=500)
+ppg_values = deque(maxlen=500)
+
+# Five-second signal-processing window.
+processing_buffer = deque(
+    maxlen=PROCESSING_WINDOW_SIZE
+)
+
+ppg_elapsed = 0.0
+last_packet_time = None
+
+log_entries = []
+max_log_entries = 100
+
+
+# ============================================================
+# 12. START BLUETOOTH RECEIVER
+# ============================================================
+
+receiver_thread = threading.Thread(
+    target=bluetooth_receiver,
+    daemon=True
+)
+
+receiver_thread.start()
+
+
+# ============================================================
+# 13. MAIN EVENT LOOP
+# ============================================================
+
+try:
+    while True:
+        event, values = my_window.read(timeout=100)
+
+        if event in (sg.WIN_CLOSED, "-EXIT-"):
+            break
+
+        # ----------------------------------------------------
+        # SAVE SETTINGS
+        # ----------------------------------------------------
+        if event == "-SAVE-":
+            try:
+                new_rest_mean = float(values["-REST-MEAN-"])
+                new_rest_alert = float(values["-REST-ALERT-"])
+                new_ex_mean = float(values["-EX-MEAN-"])
+                new_ex_alert = float(values["-EX-ALERT-"])
+
+                new_settings = [
+                    new_rest_mean,
+                    new_rest_alert,
+                    new_ex_mean,
+                    new_ex_alert
+                ]
+
+                if not all(
+                    math.isfinite(value)
+                    for value in new_settings
+                ):
+                    raise ValueError
+
+                if not all(
+                    0 <= value <= 250
+                    for value in new_settings
+                ):
+                    sg.popup(
+                        "Please enter settings between 0 and 250."
+                    )
+
+                else:
+                    resting_mean = new_rest_mean
+                    resting_alert = new_rest_alert
+                    exercise_mean = new_ex_mean
+                    exercise_alert = new_ex_alert
+
+                    user_name = (
+                        values["-USER-"].strip() or "User"
+                    )
+
+                    my_window["-USER-DISPLAY-"].update(
+                        user_name
+                    )
+
+                    sg.popup(
+                        "Settings updated successfully."
+                    )
+
+            except (ValueError, TypeError):
+                sg.popup(
+                    "Please enter valid numeric settings."
+                )
+
+        # ----------------------------------------------------
+        # EXERCISE MODE
+        # ----------------------------------------------------
+        if event == "-MODE-":
+            exercise_mode = values["-MODE-"]
+
+        # ----------------------------------------------------
+        # INFORMATION
+        # ----------------------------------------------------
+        if event == "-INFO-":
+            sg.popup(
+                "Pulse Monitor\n\n"
+                "The ESP32 calculates the main BPM reading.\n\n"
+                "Python separately filters the raw PPG samples "
+                "using a Butterworth bandpass filter and "
+                "estimates BPM using an FFT.\n\n"
+                "The Python estimate is for comparison and does "
+                "not replace the ESP32's BPM calculation.\n\n"
+                "Bluetooth reconnection is attempted automatically "
+                "after serial connection errors.\n\n"
+                "Battery status is unavailable because the "
+                "current ESP32 packet does not include battery data.",
+                title="About Pulse Monitor"
+            )
+
+        # ----------------------------------------------------
+        # DAILY SUMMARY
+        # ----------------------------------------------------
+        if event == "-DAILY-SUMMARY-":
+            selected_date = values["-SUMMARY-DATE-"].strip()
+
+            try:
+                datetime.strptime(
+                    selected_date,
+                    "%Y-%m-%d"
+                )
+
+                show_daily_summary(selected_date)
+
+            except ValueError:
+                sg.popup(
+                    "Please enter the date as YYYY-MM-DD."
+                )
+
+        # ----------------------------------------------------
+        # HANDLE BLUETOOTH MESSAGES
+        # ----------------------------------------------------
+        while True:
+            try:
+                message = bluetooth_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            message_type = message[0]
+
+            if message_type == "status":
+                status = message[1]
+
+                if status == "connected":
+                    set_status(
+                        my_window,
+                        "-BLUETOOTH-",
+                        "Bluetooth: Connected",
+                        "green"
+                    )
+
+                elif status == "connecting":
+                    set_status(
+                        my_window,
+                        "-BLUETOOTH-",
+                        "Bluetooth: Reconnecting...",
+                        "orange"
+                    )
+
+                elif status == "disconnected":
+                    set_status(
+                        my_window,
+                        "-BLUETOOTH-",
+                        "Bluetooth: Disconnected",
+                        "red"
+                    )
+
+                    set_status(
+                        my_window,
+                        "-MONITORING-",
+                        "Monitoring: Waiting for data",
+                        "orange"
+                    )
+
+                    set_status(
+                        my_window,
+                        "-LOG-STATUS-",
+                        "Log: Paused",
+                        "orange"
+                    )
+
+                    log_entries.append(
+                        f"{datetime.now():%d/%m/%Y %H:%M:%S}; "
+                        "Bluetooth disconnected; reconnecting"
+                    )
+
+                    my_window["-LOG-"].update(
+                        "\n".join(
+                            log_entries[-max_log_entries:]
+                        )
+                    )
+
+            elif message_type == "packet":
+                (
+                    sequence_number,
+                    esp32_bpm,
+                    raw_samples
+                ) = message[1]
+
+                last_packet_time = time.monotonic()
+
+                # --------------------------------------------
+                # APPEND RAW SAMPLES
+                # --------------------------------------------
+                for sample in raw_samples:
+                    ppg_elapsed += SAMPLE_INTERVAL
+
+                    ppg_times.append(ppg_elapsed)
+                    ppg_values.append(sample)
+
+                    processing_buffer.append(sample)
+
+                # --------------------------------------------
+                # FILTER THE ROLLING PPG BUFFER
+                # --------------------------------------------
+                filtered_values = []
+                fft_bpm = 0.0
+
+                if len(processing_buffer) >= 150:
+                    raw_window = np.asarray(
+                        processing_buffer,
+                        dtype=float
+                    )
+
+                    filtered_values = (
+                        signal_processor.filter_signal(raw_window)
+                    ).tolist()
+
+                    if np.std(filtered_values) >= 5:
+                        fft_bpm, freqs, fft_vals = (
+                            signal_processor.calculate_fft_bpm(
+                                np.asarray(filtered_values)
+                            )
+                        )
+
+                # --------------------------------------------
+                # UPDATE RAW AND FILTERED GRAPHS
+                # --------------------------------------------
+                update_ppg_plots(
+                    ax_raw,
+                    ax_filtered,
+                    fig_canvas,
+                    ppg_times,
+                    ppg_values,
+                    filtered_values
+                )
+
+                # --------------------------------------------
+                # UPDATE PYTHON FFT ESTIMATE
+                # --------------------------------------------
+                if fft_bpm > 0:
+                    my_window["-FFT-BPM-"].update(
+                        f"{fft_bpm:.1f} BPM"
+                    )
+
+                    my_window["-FFT-STATUS-"].update(
+                        "Estimate available",
+                        text_color="green"
+                    )
+
+                else:
+                    my_window["-FFT-BPM-"].update("--")
+
+                    if len(processing_buffer) < 150:
+                        my_window["-FFT-STATUS-"].update(
+                            "Collecting samples",
+                            text_color="gray"
+                        )
+                    else:
+                        my_window["-FFT-STATUS-"].update(
+                            "Signal too weak",
+                            text_color="orange"
+                        )
+
+                # --------------------------------------------
+                # USE ESP32 BPM AS THE MAIN READING
+                # --------------------------------------------
+                if esp32_bpm <= 0:
+                    continue
+
+                timestamp = datetime.now()
+
+                my_window["-CURRENT-BPM-"].update(
+                    f"{esp32_bpm:.1f} BPM"
+                )
+
+                # --------------------------------------------
+                # SELECT ACTIVE ALERT SETTINGS
+                # --------------------------------------------
+                if exercise_mode:
+                    mean_pulse = exercise_mean
+                    alert_range = exercise_alert
+                    mode_name = "Exercise"
+                else:
+                    mean_pulse = resting_mean
+                    alert_range = resting_alert
+                    mode_name = "Resting"
+
+                low_threshold = mean_pulse - alert_range
+                high_threshold = mean_pulse + alert_range
+
+                if esp32_bpm < low_threshold:
+                    indicator = "LOW"
+                elif esp32_bpm > high_threshold:
+                    indicator = "HIGH"
+                else:
+                    indicator = "NORMAL"
+
+                indicator_changed = (
+                    "YES"
+                    if indicator != previous_indicator
+                    else "NO"
+                )
+
+                alert_event = (
+                    indicator
+                    if indicator in ("LOW", "HIGH")
+                    and indicator != previous_indicator
+                    else ""
+                )
+
+                previous_indicator = indicator
+
+                # --------------------------------------------
+                # UPDATE LOW / NORMAL / HIGH INDICATORS
+                # --------------------------------------------
+                indicator_colours = {
+                    "LOW": "#F4A6A6",
+                    "NORMAL": "#A8E6A1",
+                    "HIGH": "#F4A6A6"
+                }
+
+                for key, name in [
+                    ("-LOW-", "LOW"),
+                    ("-NORMAL-", "NORMAL"),
+                    ("-HIGH-", "HIGH")
+                ]:
+                    if indicator == name:
+                        my_window[key].update(
+                            background_color=indicator_colours[name],
+                            text_color="black"
+                        )
+                    else:
+                        my_window[key].update(
+                            background_color="white",
+                            text_color="black"
+                        )
+
+                # --------------------------------------------
+                # SAVE MAIN ESP32 BPM TO CSV
+                # --------------------------------------------
+                try:
+                    save_reading(
+                        timestamp,
+                        esp32_bpm,
+                        indicator,
+                        indicator_changed,
+                        alert_event,
+                        mode_name
+                    )
+
+                    set_status(
+                        my_window,
+                        "-LOG-STATUS-",
+                        "Log: Recording",
+                        "green"
+                    )
+
+                except OSError as error:
+                    set_status(
+                        my_window,
+                        "-LOG-STATUS-",
+                        "Log: Error saving",
+                        "red"
+                    )
+
+                    print(f"CSV logging error: {error}")
+
+                # --------------------------------------------
+                # UPDATE MONITORING STATUS
+                # --------------------------------------------
+                set_status(
+                    my_window,
+                    "-MONITORING-",
+                    "Monitoring: Active",
+                    "green"
+                )
+
+                # --------------------------------------------
+                # ADD TIMESTAMPED LOG ENTRY
+                # --------------------------------------------
+                log_line = (
+                    f"{timestamp:%d/%m/%Y %H:%M:%S}; "
+                    f"ESP32: {esp32_bpm:.1f} BPM; "
+                    f"Python FFT: {fft_bpm:.1f} BPM; "
+                    f"{indicator}; {mode_name}; "
+                    f"Packet {sequence_number}"
+                )
+
+                if alert_event:
+                    log_line += f"; {alert_event} alert"
+
+                log_entries.append(log_line)
+
+                my_window["-LOG-"].update(
+                    "\n".join(
+                        log_entries[-max_log_entries:]
+                    )
+                )
+
+        # ----------------------------------------------------
+        # DETECT STALE DATA
+        # ----------------------------------------------------
+        if (
+            last_packet_time is not None
+            and time.monotonic() - last_packet_time > 3
+        ):
+            set_status(
+                my_window,
+                "-MONITORING-",
+                "Monitoring: Waiting for data",
+                "orange"
+            )
+
+            set_status(
+                my_window,
+                "-LOG-STATUS-",
+                "Log: Paused",
+                "orange"
+            )
+
+            last_packet_time = None
+
+finally:
+    # Stop the receiver and allow it to close its serial port.
+    stop_receiver.set()
+
+    if receiver_thread.is_alive():
+        receiver_thread.join(timeout=1)
+
+    my_window.close()
